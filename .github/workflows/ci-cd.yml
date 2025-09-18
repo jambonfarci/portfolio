@@ -1,0 +1,297 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: '20'
+  RUST_VERSION: '1.75'
+
+jobs:
+  # Backend Tests
+  backend-test:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ env.RUST_VERSION }}
+        components: rustfmt, clippy
+    
+    - name: Cache Cargo dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          backend/target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('backend/Cargo.lock') }}
+    
+    - name: Check formatting
+      run: cargo fmt --check
+      working-directory: ./backend
+    
+    - name: Run Clippy
+      run: cargo clippy -- -D warnings
+      working-directory: ./backend
+    
+    - name: Run tests
+      run: cargo test --verbose
+      working-directory: ./backend
+    
+    - name: Run performance tests
+      run: cargo test --test performance_test --verbose
+      working-directory: ./backend
+
+  # Frontend Tests
+  frontend-test:
+    name: Frontend Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+    
+    - name: Install dependencies
+      run: npm ci
+      working-directory: ./frontend
+    
+    - name: Run type checking
+      run: npm run check
+      working-directory: ./frontend
+    
+    - name: Run linting
+      run: npm run lint
+      working-directory: ./frontend
+    
+    - name: Run tests
+      run: npm run test
+      working-directory: ./frontend
+
+  # Security Audit
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+    
+    - name: Run Rust security audit
+      run: cargo audit
+      working-directory: ./backend
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+    
+    - name: Run npm audit
+      run: npm audit --audit-level moderate
+      working-directory: ./frontend
+
+  # Build and Test Docker Images
+  docker-build:
+    name: Docker Build Test
+    runs-on: ubuntu-latest
+    needs: [backend-test, frontend-test]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build backend Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        file: ./backend/Dockerfile
+        push: false
+        tags: portfolio-backend:test
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Build frontend Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./frontend
+        file: ./frontend/Dockerfile
+        push: false
+        tags: portfolio-frontend:test
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Test Docker Compose
+      run: |
+        docker-compose -f docker-compose.prod.yml config
+        echo "Docker Compose configuration is valid"
+
+  # Integration Tests
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build and start services
+      run: |
+        docker-compose -f docker-compose.prod.yml up --build -d
+        sleep 30  # Wait for services to start
+    
+    - name: Run smoke tests
+      run: |
+        chmod +x scripts/smoke-tests.sh
+        ./scripts/smoke-tests.sh
+    
+    - name: Check service logs
+      if: failure()
+      run: |
+        docker-compose -f docker-compose.prod.yml logs
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        docker-compose -f docker-compose.prod.yml down -v
+
+  # Deploy to Production (only on main branch)
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [backend-test, frontend-test, security-audit, integration-test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    environment:
+      name: production
+      url: https://your-domain.com
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Build and push backend image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        file: ./backend/Dockerfile
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository }}/backend:latest
+          ghcr.io/${{ github.repository }}/backend:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Build and push frontend image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./frontend
+        file: ./frontend/Dockerfile
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository }}/frontend:latest
+          ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    # Add your deployment steps here
+    # For example, deploy to your server via SSH, update Kubernetes manifests, etc.
+    - name: Deploy to server
+      run: |
+        echo "Add your deployment commands here"
+        echo "For example:"
+        echo "- SSH to your server"
+        echo "- Pull new images"
+        echo "- Update docker-compose.yml"
+        echo "- Restart services"
+        echo "- Run health checks"
+
+  # Performance Testing (optional, runs on schedule)
+  performance-test:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Start services
+      run: |
+        docker-compose -f docker-compose.prod.yml up --build -d
+        sleep 30
+    
+    - name: Install k6
+      run: |
+        sudo gpg -k
+        sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+        sudo apt-get update
+        sudo apt-get install k6
+    
+    - name: Run performance tests
+      run: |
+        # Create a simple k6 test script
+        cat > performance-test.js << 'EOF'
+        import http from 'k6/http';
+        import { check } from 'k6';
+        
+        export let options = {
+          stages: [
+            { duration: '30s', target: 10 },
+            { duration: '1m', target: 50 },
+            { duration: '30s', target: 0 },
+          ],
+        };
+        
+        export default function() {
+          let response = http.get('http://localhost/api/projects');
+          check(response, {
+            'status is 200': (r) => r.status === 200,
+            'response time < 500ms': (r) => r.timings.duration < 500,
+          });
+        }
+        EOF
+        
+        k6 run performance-test.js
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        docker-compose -f docker-compose.prod.yml down -v
