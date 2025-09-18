@@ -1,0 +1,16 @@
+FROM rust:latest
+
+WORKDIR /app
+
+# Install cargo-watch for hot reloading
+RUN cargo install cargo-watch
+
+# Copy Cargo files
+COPY Cargo.toml ./
+COPY src ./src
+
+# Expose port
+EXPOSE 3001
+
+# Command for development with hot reloading
+CMD ["cargo", "watch", "-x", "run"]

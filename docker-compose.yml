@@ -1,0 +1,38 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+    environment:
+      - DATABASE_URL=sqlite:./data/portfolio.db
+      - RUST_LOG=debug
+    depends_on:
+      - db-init
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "5174:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_URL=http://localhost:3001
+    depends_on:
+      - backend
+
+  db-init:
+    image: alpine:latest
+    volumes:
+      - ./data:/data
+    command: sh -c "mkdir -p /data && touch /data/portfolio.db"
+
+volumes:
+  data:
